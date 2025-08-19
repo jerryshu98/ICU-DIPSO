@@ -9,7 +9,497 @@ from sklearn.metrics import precision_score, recall_score, roc_auc_score, brier_
 from sklearn.model_selection import cross_val_score, train_test_split
 from sklearn.calibration import CalibratedClassifierCV  
 from sklearn.isotonic import IsotonicRegression  
+import warningsimport pandas as pd
+import numpy as np
+import statsmodels.api as sm
+from sklearn.pipeline import make_pipeline  
+from sklearn.preprocessing import StandardScaler 
+from sklearn.ensemble import StackingClassifier 
+from scipy.stats import norm
+from sklearn.metrics import precision_score, recall_score, roc_auc_score, brier_score_loss
+from sklearn.model_selection import cross_val_score, train_test_split
+from sklearn.calibration import CalibratedClassifierCV  
+from sklearn.isotonic import IsotonicRegression  
 import warnings
+from tqdm import tqdm
+import time
+from sklearn.utils import resample
+import matplotlib.pyplot as plt  
+from sklearn.calibration import calibration_curve
+from sklearn.model_selection import cross_validate
+from sklearn.metrics import make_scorer, precision_score, recall_score, f1_score, roc_auc_score
+############################################################################
+# Base Models
+from sklearn.linear_model import LogisticRegressionCV, RidgeClassifier, ElasticNetCV
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, ExtraTreesClassifier
+from sklearn.svm import SVC
+from sklearn.neural_network import MLPClassifier
+from sklearn.naive_bayes import GaussianNB
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+from xgboost import XGBClassifier
+import lightgbm as lgb
+import warnings
+
+
+    
+def data_loading(file_path, test_size=0.3, random_state=42):
+        df = pd.read_csv(file_path)
+        Y = df["Y"].values
+        A = df["A"].values
+        W = df.drop(columns=["Y", "A"])
+        W_A = df.drop(columns=["Y"])
+        
+        indices = np.arange(len(Y))
+        train_idx, test_idx = train_test_split(
+            indices, test_size=test_size, random_state=random_state, 
+            stratify=A
+        )
+
+        print(f" Sample split summary:")
+        print(f"   Total samples: {len(Y)}")
+        print(f"   Train samples: {len(train_idx)} ({len(train_idx)/len(Y)*100:.1f}%)")
+        print(f"   Test samples: {len(test_idx)} ({len(test_idx)/len(Y)*100:.1f}%)")
+        print(f"   Train treatment prop: {A[train_idx].mean():.3f}")
+        print(f"   Test treatment prop: {A[test_idx].mean():.3f}")
+        
+        return {
+            'train': {
+                'Y': Y[train_idx], 'A': A[train_idx], 
+                'W': W.iloc[train_idx], 'W_A': W_A.iloc[train_idx],
+                'indices': train_idx
+            },
+            'test': {
+                'Y': Y[test_idx], 'A': A[test_idx],
+                'W': W.iloc[test_idx], 'W_A': W_A.iloc[test_idx], 
+                'indices': test_idx
+            }
+        }
+
+def data_preprocessing(W_train, W_test=None):
+
+        # Determine W_train type
+        if isinstance(W_train, pd.DataFrame):
+            median_train = W_train.median()
+        else:
+            median_train = np.median(W_train, axis=0)
+        # Data cleaning: fill NaN values with median
+        if isinstance(W_train, pd.DataFrame):
+            W_train_clean = W_train.fillna(median_train)
+        else:
+            W_train_clean = np.where(np.isnan(W_train), median_train, W_train)
+        # ======================================================================   
+        scaler = StandardScaler()
+        W_train_standardized = scaler.fit_transform(W_train_clean)
+        # ======================================================================
+        if isinstance(W_train, pd.DataFrame):
+            W_train_df = pd.DataFrame(W_train_standardized, columns=W_train.columns)
+        else:
+            W_train_df = pd.DataFrame(W_train_standardized)
+        
+        if W_test is not None:
+            if isinstance(W_test, pd.DataFrame):
+                W_test_clean = W_test.fillna(median_train)
+            else:
+                W_test_clean = np.where(np.isnan(W_test), median_train, W_test)
+            W_test_standardized = scaler.transform(W_test_clean)
+            if isinstance(W_test, pd.DataFrame):
+                W_test_df = pd.DataFrame(W_test_standardized, columns=W_test.columns)
+            else:
+                W_test_df = pd.DataFrame(W_test_standardized)
+            return W_train_df, W_test_df, scaler
+        return W_train_df, scaler
+
+def get_base_learners(n_features):
+        '''base learners with improved parameters'''
+        base_learners = [
+            # ========== LINEAR MODELS ==========
+            ('logistic_cv', LogisticRegressionCV(
+                cv=5, 
+                max_iter=10000, 
+                random_state=42,
+                solver='lbfgs',
+                scoring='roc_auc',
+                class_weight='balanced'
+            )),
+            
+            ('logistic_l1', LogisticRegressionCV(
+                cv=5, 
+                max_iter=10000, 
+                penalty='l1',
+                solver='liblinear', 
+                random_state=42,
+                tol=1e-4,
+                scoring='roc_auc',
+                class_weight='balanced'
+            )),
+            
+            ('logistic_elastic', make_pipeline(
+                StandardScaler(),
+                LogisticRegressionCV(
+                    cv=5,
+                    penalty='elasticnet',
+                    solver='saga',
+                    l1_ratios=[0.1, 0.5, 0.7, 0.9],
+                    max_iter=5000,
+                    random_state=42,
+                    class_weight='balanced'
+                )
+            )),
+            
+            # ========== TREE-BASED MODELS ==========
+            ('rf', RandomForestClassifier(
+                n_estimators=150,
+                max_depth=10,
+                min_samples_split=15,
+                min_samples_leaf=8,
+                max_features='sqrt',
+                class_weight='balanced',
+                random_state=42,
+                n_jobs=-1
+            )),
+            
+            ('extra_trees', ExtraTreesClassifier(
+                n_estimators=100,
+                max_depth=8,
+                min_samples_split=20,
+                min_samples_leaf=10,
+                max_features='sqrt',
+                class_weight='balanced',
+                random_state=42,
+                n_jobs=-1
+            )),
+            
+            ('gbm', GradientBoostingClassifier(
+                n_estimators=150,
+                max_depth=5,
+                learning_rate=0.08,
+                subsample=0.8,
+                max_features='sqrt',
+                random_state=42,
+                validation_fraction=0.1,
+                n_iter_no_change=10
+            )),
+            
+            ('xgb', XGBClassifier(
+                n_estimators=150,
+                max_depth=5,
+                learning_rate=0.08,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                reg_alpha=0.1,
+                reg_lambda=0.1,
+                scale_pos_weight=1,
+                random_state=42,
+                eval_metric='logloss',
+                verbosity=0,
+                n_jobs=-1
+            )),
+            
+            ('lgbm', lgb.LGBMClassifier(
+                n_estimators=150,
+                max_depth=5,
+                learning_rate=0.08,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                reg_alpha=0.1,
+                reg_lambda=0.1,
+                random_state=42,
+                verbosity=-1,
+                n_jobs=-1,
+                class_weight='balanced'
+            )),
+            
+            # ========== NON-LINEAR MODELS ==========
+            ('svm_rbf', make_pipeline(
+                StandardScaler(),
+                SVC(
+                    probability=True,
+                    kernel='rbf',
+                    C=1.0,
+                    gamma='scale',
+                    class_weight='balanced',
+                    random_state=42
+                )
+            )),
+            
+            ('svm_linear', make_pipeline(
+                StandardScaler(),
+                SVC(
+                    probability=True,
+                    kernel='linear',
+                    C=0.1,
+                    class_weight='balanced',
+                    random_state=42
+                )
+            )),
+            
+            ('mlp', make_pipeline(
+                StandardScaler(),
+                MLPClassifier(
+                    hidden_layer_sizes=(50, 30, 15),
+                    max_iter=3000,
+                    alpha=0.01,
+                    learning_rate='adaptive',
+                    early_stopping=True,
+                    validation_fraction=0.1,
+                    n_iter_no_change=15,
+                    random_state=42
+                )
+            )),
+            
+            # ========== SIMPLE MODELS ==========
+            ('nb', make_pipeline(
+                StandardScaler(),
+                GaussianNB()
+            )),
+            
+            ('knn', make_pipeline(
+                StandardScaler(),
+                KNeighborsClassifier(
+                    n_neighbors=15,
+                    weights='distance',
+                    n_jobs=-1
+                )
+            )),
+            
+            ('dt', DecisionTreeClassifier(
+                max_depth=6,
+                min_samples_split=30,
+                min_samples_leaf=15,
+                class_weight='balanced',
+                random_state=42
+            ))
+        ]
+        return base_learners
+
+def fit_superlearner(X, Y, base_learners, model_name="SuperLearner"):
+        
+        
+        pbar = tqdm(total=len(base_learners) + 2, desc=f"====== Training {model_name} ======", leave=False)
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning)
+            warnings.filterwarnings("ignore", category=FutureWarning)
+            
+            meta_learner = LogisticRegressionCV(cv=3, max_iter=5000, 
+                                              random_state=42, solver='lbfgs')
+            
+            pbar.set_description(f"Building {model_name}")
+            pbar.update(1)
+            
+            sl = StackingClassifier(
+                estimators=base_learners,
+                cv=3,
+                stack_method='predict_proba',
+                final_estimator=meta_learner,
+                n_jobs=-1
+            )
+            
+            try:
+                pbar.set_description(f"======  Fitting {model_name} ======  ")
+                sl.fit(X, Y)
+                pbar.update(1)
+
+                pbar.set_description(f"====== Evaluating {model_name} ======")
+                cv_scores = cross_val_score(sl, X, Y, cv=3, scoring='roc_auc')
+                
+                print(f"{model_name} Train CV AUC: {cv_scores.mean():.4f} (+/- {cv_scores.std() * 2:.4f})")
+                
+            except Exception as e:
+                print(f"Warning: {model_name} fitting failed: {str(e)}")
+                print("Using simplified model...")
+                from sklearn.linear_model import LogisticRegression
+                sl = LogisticRegression(max_iter=5000, random_state=42)
+                sl.fit(X, Y)
+            
+            finally:
+                pbar.close()
+        
+        return sl
+def downsampling_g_model_dataset(A_train, W_train_standardized, A_test, W_test_standardized):
+    treated_idx = A_train == 1
+    control_idx = A_train == 0
+    W_treated = W_train_standardized[treated_idx]
+    W_control = W_train_standardized[control_idx]
+    A_treated = A_train[treated_idx]
+    A_control = A_train[control_idx]
+
+    if len(W_treated) > len(W_control):
+        W_treated_down = resample(W_treated, replace=False, n_samples=len(W_control), random_state=42)
+        A_treated_down = resample(A_treated, replace=False, n_samples=len(W_control), random_state=42)
+
+        W_down = np.vstack([W_treated_down, W_control])
+        A_down = np.concatenate([A_treated_down, A_control])
+    else:
+        W_control_down = resample(W_control, replace=False, n_samples=len(W_treated), random_state=42)
+        A_control_down = resample(A_control, replace=False, n_samples=len(W_treated), random_state=42)
+
+        W_down = np.vstack([W_treated, W_control_down])
+        A_down = np.concatenate([A_treated, A_control_down])
+    
+    print(f"g-model training samples (downsampled): {W_down.shape}, A=1 proportion: {np.mean(A_down):.2f}")
+    return W_down, A_down
+
+def evaluate_calibration(y_true, y_prob, n_bins=10):
+        
+        fraction_of_positives, mean_predicted_value = calibration_curve(
+            y_true, y_prob, n_bins=n_bins, strategy='uniform'
+        )
+        bin_boundaries = np.linspace(0, 1, n_bins + 1)
+        bin_lowers = bin_boundaries[:-1]
+        bin_uppers = bin_boundaries[1:]
+        # Calibration Error
+        calibration_error = 0
+        for bin_lower, bin_upper in zip(bin_lowers, bin_uppers):
+            in_bin = (y_prob > bin_lower) & (y_prob <= bin_upper) 
+            prop_in_bin = in_bin.mean()
+            
+            if prop_in_bin > 0:
+                accuracy_in_bin = y_true[in_bin].mean()
+                avg_confidence_in_bin = y_prob[in_bin].mean()
+                calibration_error += np.abs(avg_confidence_in_bin - accuracy_in_bin) * prop_in_bin
+        
+        # Brier Score
+        brier_score = brier_score_loss(y_true, y_prob)
+        
+        return {
+            'calibration_error': calibration_error,
+            'brier_score': brier_score,
+            'fraction_of_positives': fraction_of_positives,
+            'mean_predicted_value': mean_predicted_value
+        }
+
+def calibrate_classifier(base_model, X_train, y_train, method='platt'):
+        
+        print(f"   🎯 Calibrating classifier using {method} method...")
+        
+        if method == 'platt':
+            calibrated_model = CalibratedClassifierCV(
+                base_model, method='sigmoid', cv=3
+            )
+        elif method == 'isotonic':
+            calibrated_model = CalibratedClassifierCV(
+                base_model, method='isotonic', cv=3
+            )
+        else:
+            print(f"   ⚠️  Unknown calibration method: {method}. Using Platt scaling.")
+            calibrated_model = CalibratedClassifierCV(
+                base_model, method='sigmoid', cv=3
+            )
+        
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore")
+            calibrated_model.fit(X_train, y_train)
+        
+        return calibrated_model
+
+def predict_Q_models(sl, W_A_data, Y, is_test=False):
+
+    data_type = "test" if is_test else "train"
+    # print(f"   Predicting Q models on {data_type} set...")
+    # Predict Q_A
+    Q_A = sl.predict_proba(W_A_data)[:, 1]
+    # Predict Q_1 
+    W_A1 = W_A_data.copy()
+    W_A1["A"] = 1  
+    Q_1 = sl.predict_proba(W_A1)[:, 1]
+    # Predict Q_0
+    W_A0 = W_A_data.copy()
+    W_A0["A"] = 0
+    Q_0 = sl.predict_proba(W_A0)[:, 1]
+
+    y_pred_class = (Q_A >= 0.5).astype(int)
+    # calculate precision, recall, F1-score, ROC-AUC
+    metrics = {
+        'set': data_type,
+            "Precision": precision_score(Y, y_pred_class),
+            "Recall": recall_score(Y, y_pred_class),
+            "F1": f1_score(Y, y_pred_class),
+            "ROC_AUC": roc_auc_score(Y, Q_A)
+        }
+
+    return Q_A, Q_1, Q_0, pd.DataFrame([metrics])
+
+    
+def estimate_fluctuation_param(Y, Q_A, H_1, H_0, A, H_overlap=None):
+        print("📈 Estimating fluctuation parameter (Overlap Weighting)...")
+        
+        Q_A_clipped = np.clip(Q_A, 1e-6, 1 - 1e-6)
+        logit_QA = np.log(Q_A_clipped / (1 - Q_A_clipped))
+
+        if H_overlap is not None:
+            H_A = H_overlap
+        else:
+            H_A = A * H_1 - (1 - A) * H_0
+            
+        H_A = H_A.reshape(-1, 1) if H_A.ndim == 1 else H_A
+
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore")
+                model = sm.GLM(Y, H_A, offset=logit_QA, family=sm.families.Binomial()).fit()
+                eps = model.params[0]
+                print(f"   Fluctuation parameter (epsilon): {eps:.6f}")
+        except Exception as e:
+            print(f"   GLM fitting failed, using fallback method: {str(e)}")
+            eps = 0.0
+            
+        return eps
+
+def update_Q(Q_base, H, eps):
+        
+        Q_clipped = np.clip(Q_base, 1e-6, 1 - 1e-6)
+        logit_Q = np.log(Q_clipped / (1 - Q_clipped))
+        updated_Q = 1 / (1 + np.exp(-(logit_Q + eps * H)))
+        return np.clip(updated_Q, 1e-6, 1 - 1e-6)
+
+def compute_tmle(Y, A, Q_A_update, Q_1_update, Q_0_update, H_1, H_0, overlap_weights=None, H_overlap=None):
+        print("🎯 Computing TMLE estimates ATE...")
+        
+        if overlap_weights is not None:
+            # ATE with Overlap Weighting
+            ate_numerator = np.mean((Q_1_update - Q_0_update) * overlap_weights)
+            ate_denominator = np.mean(overlap_weights)
+            ate = ate_numerator / ate_denominator
+            
+
+            # Influence function
+            if H_overlap is not None:
+                term1 = H_overlap * (Y - Q_A_update)
+            else:
+                term1 = (A * H_1 - (1 - A) * H_0) * (Y - Q_A_update)
+                
+            term2 = ((Q_1_update - Q_0_update) * overlap_weights - ate * overlap_weights) / ate_denominator
+            infl_fn = term1 + term2 - ate
+            
+        else:
+            # Fallback: Original ATE & ATT no overlap weighting
+            ate = np.mean(Q_1_update - Q_0_update)
+            # Influence function
+            H_A = A * H_1 - (1 - A) * H_0
+            infl_fn = H_A * (Y - Q_A_update) + (Q_1_update - Q_0_update) - ate
+        
+        # Calculating standard error, 95% CI, p-value
+        se = np.sqrt(np.var(infl_fn) / len(Y))
+        ci_low = ate - 1.96 * se
+        ci_high = ate + 1.96 * se
+        p_value = 2 * (1 - norm.cdf(abs(ate / se))) if se > 0 else 1.0
+
+        results_df = pd.DataFrame({
+        "Estimand": ["ATE"],
+        "Estimate": [ate],
+        "Std.Err": [se],
+        "95% CI": [f"[{ci_low:.6f}, {ci_high:.6f}]"],
+        "P-value": [p_value]
+        })
+        # can return infl_fn if needed for further analysis
+        return results_df
+
+if __name__ == "__main__":
+    pass
 from tqdm import tqdm
 import time
 from sklearn.utils import resample
